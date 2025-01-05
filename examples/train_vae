@@ -1,0 +1,115 @@
+import tensorflow as tf
+import matplotlib.pyplot as plt
+import os
+import sys
+
+# Add parent directory to path to import from models and utils
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from models.autoencoders import VariationalAutoencoder
+from utils.data import load_and_preprocess_images, create_training_datasets
+
+def plot_reconstructions(model, test_images, num_images=10):
+    """Plot original and reconstructed images side by side."""
+    reconstructions = model(test_images)
+    
+    plt.figure(figsize=(20, 4))
+    for i in range(num_images):
+        # Original
+        ax = plt.subplot(2, num_images, i + 1)
+        plt.imshow(test_images[i].numpy().squeeze(), cmap='gray')
+        plt.axis('off')
+        if i == 0:
+            plt.title('Original')
+            
+        # Reconstruction
+        ax = plt.subplot(2, num_images, i + num_images + 1)
+        plt.imshow(reconstructions[i].numpy().squeeze(), cmap='gray')
+        plt.axis('off')
+        if i == 0:
+            plt.title('Reconstructed')
+            
+    plt.tight_layout()
+    plt.show()
+
+def plot_latent_space(model, n=30, figsize=15):
+    """Plot samples from the latent space."""
+    # Sample from latent space
+    noise = tf.random.normal((n * n, model.latent_dim))
+    generated = model.decoder(noise)
+    
+    plt.figure(figsize=(figsize, figsize))
+    for i in range(n * n):
+        ax = plt.subplot(n, n, i + 1)
+        plt.imshow(generated[i].numpy().squeeze(), cmap='gray')
+        plt.axis('off')
+    plt.tight_layout()
+    plt.show()
+
+def main():
+    # Parameters
+    BATCH_SIZE = 128
+    EPOCHS = 50
+    LATENT_DIM = 2  # Small for visualization purposes
+    
+    # Load and prepare data
+    x_train, x_test = load_and_preprocess_images("mnist")
+    train_dataset, val_dataset, test_dataset = create_training_datasets(
+        x_train, x_test, batch_size=BATCH_SIZE
+    )
+    
+    # Create model
+    input_shape = (28, 28, 1)  # MNIST image shape
+    vae = VariationalAutoencoder(input_shape, latent_dim=LATENT_DIM)
+    
+    # Compile model
+    vae.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3)
+    )
+    
+    # Setup callbacks
+    callbacks = [
+        tf.keras.callbacks.EarlyStopping(
+            monitor='val_loss',
+            patience=5,
+            restore_best_weights=True
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.5,
+            patience=2
+        )
+    ]
+    
+    # Train model
+    history = vae.fit(
+        train_dataset,
+        epochs=EPOCHS,
+        validation_data=val_dataset,
+        callbacks=callbacks
+    )
+    
+    # Plot training history
+    plt.figure(figsize=(10, 4))
+    plt.subplot(1, 2, 1)
+    plt.plot(history.history['loss'], label='Training Loss')
+    plt.plot(history.history['val_loss'], label='Validation Loss')
+    plt.title('Model Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.show()
+    
+    # Plot reconstructions
+    test_batch = next(iter(test_dataset))
+    plot_reconstructions(vae, test_batch)
+    
+    # Plot samples from latent space
+    plot_latent_space(vae)
+    
+    # Save model
+    vae.save_weights('vae_mnist.h5')
+    print("Model saved to 'vae_mnist.h5'")
+
+if __name__ == "__main__":
+    main()
