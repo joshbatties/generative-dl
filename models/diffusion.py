@@ -2,241 +2,314 @@ import tensorflow as tf
 import numpy as np
 
 class TimestepEmbedding(tf.keras.layers.Layer):
-    """Embeds scalar timesteps into vectors, as described in DDPM paper."""
-    def __init__(self, dim, max_period=10000):
+    def __init__(self, embedding_dim, max_period=10000):
         super().__init__()
-        self.dim = dim
+        self.embedding_dim = embedding_dim
         self.max_period = max_period
         
     def call(self, timesteps):
-        half = self.dim // 2
+        half = self.embedding_dim // 2
         freqs = tf.exp(
-            -tf.math.log(self.max_period) * tf.range(half, dtype=tf.float32) / half
+            -tf.math.log(float(self.max_period)) * 
+            tf.range(0, half, dtype=tf.float32) / half
         )
         args = tf.cast(timesteps, dtype=tf.float32)[:, None] * freqs[None]
         embedding = tf.concat([tf.cos(args), tf.sin(args)], axis=-1)
-        if self.dim % 2:
+        if self.embedding_dim % 2:
             embedding = tf.pad(embedding, [[0, 0], [0, 1]])
         return embedding
 
-def get_diffusion_schedule(num_diffusion_steps):
-    """Returns cosine variance schedule as in improved DDPM paper."""
-    def cosine_beta_schedule(timesteps, s=0.008):
-        steps = timesteps + 1
-        x = tf.range(steps, dtype=tf.float32) / steps
-        alphas_cumprod = tf.cos((x + s) / (1 + s) * tf.constant(np.pi) * 0.5) ** 2
+def get_beta_schedule(num_diffusion_steps, schedule_type='cosine'):
+    if schedule_type == 'linear':
+        scale = 1000 / num_diffusion_steps
+        beta_start = scale * 0.0001
+        beta_end = scale * 0.02
+        return np.linspace(beta_start, beta_end, num_diffusion_steps)
+    
+    elif schedule_type == 'cosine':
+        steps = num_diffusion_steps + 1
+        x = np.linspace(0, num_diffusion_steps, steps)
+        alphas_cumprod = np.cos(((x / num_diffusion_steps) + 0.008) / 1.008 * np.pi * 0.5) ** 2
         alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
         betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-        return tf.clip_by_value(betas, 0, 0.999)
+        return np.clip(betas, 0.0001, 0.9999)
 
-    betas = cosine_beta_schedule(num_diffusion_steps)
-    alphas = 1. - betas
-    alphas_cumprod = tf.math.cumprod(alphas, axis=0)
-    alphas_cumprod_prev = tf.pad(alphas_cumprod[:-1], [[1, 0]], constant_values=1.0)
-    
-    return {
-        'betas': betas,
-        'alphas': alphas,
-        'alphas_cumprod': alphas_cumprod,
-        'alphas_cumprod_prev': alphas_cumprod_prev,
-    }
+class ResidualBlock(tf.keras.layers.Layer):
+    def __init__(self, out_channels, use_conv=False, dropout=0.1):
+        super().__init__()
+        self.out_channels = out_channels
+        self.use_conv = use_conv
+        
+        self.conv1 = tf.keras.layers.Conv2D(out_channels, 3, padding='same')
+        self.conv2 = tf.keras.layers.Conv2D(out_channels, 3, padding='same')
+        
+        self.time_emb = tf.keras.layers.Dense(out_channels)
+        
+        self.norm1 = tf.keras.layers.GroupNormalization(groups=8)
+        self.norm2 = tf.keras.layers.GroupNormalization(groups=8)
+        
+        self.dropout = tf.keras.layers.Dropout(dropout)
+        
+        if use_conv:
+            self.shortcut = tf.keras.layers.Conv2D(out_channels, 1)
+        
+    def call(self, x, time_emb, training=False):
+        h = self.norm1(x)
+        h = tf.nn.swish(h)
+        h = self.conv1(h)
+        
+        # Add time embedding
+        time_emb = tf.nn.swish(time_emb)
+        time_emb = self.time_emb(time_emb)
+        h = h + time_emb[:, None, None]
+        
+        h = self.norm2(h)
+        h = tf.nn.swish(h)
+        h = self.dropout(h, training=training)
+        h = self.conv2(h)
+        
+        if self.use_conv:
+            x = self.shortcut(x)
+            
+        return x + h
+
+class AttentionBlock(tf.keras.layers.Layer):
+    def __init__(self, channels):
+        super().__init__()
+        self.channels = channels
+        self.norm = tf.keras.layers.GroupNormalization(groups=8)
+        self.qkv = tf.keras.layers.Conv2D(channels * 3, 1)
+        self.proj = tf.keras.layers.Conv2D(channels, 1)
+        
+    def call(self, x):
+        B, H, W, C = tf.shape(x)
+        h = self.norm(x)
+        qkv = self.qkv(h)
+        qkv = tf.reshape(qkv, (B, H * W, 3, C))
+        q, k, v = tf.unstack(qkv, axis=2)
+        
+        scale = 1 / tf.sqrt(tf.cast(C, tf.float32))
+        attention = tf.matmul(q, k, transpose_b=True) * scale
+        attention = tf.nn.softmax(attention, axis=-1)
+        
+        h = tf.matmul(attention, v)
+        h = tf.reshape(h, (B, H, W, C))
+        return x + self.proj(h)
 
 class DiffusionModel(tf.keras.Model):
-    """Implementation of DDPM (Ho et al., 2020) & improved DDPM."""
-    
-    def __init__(self, 
-                 timesteps=1000,
-                 img_size=32,
-                 img_channels=3,
-                 embedding_dims=256,
-                 widths=(128, 256, 256, 512),
-                 block_depth=2,
-                 **kwargs):
-        super().__init__(**kwargs)
-        
-        self.timesteps = timesteps
+    def __init__(
+        self,
+        img_size=32,
+        img_channels=3,
+        base_channels=128,
+        channel_mults=(1, 2, 2, 2),
+        num_res_blocks=2,
+        timesteps=1000,
+        schedule_type='cosine'
+    ):
+        super().__init__()
         self.img_size = img_size
         self.img_channels = img_channels
+        self.timesteps = timesteps
         
-        # Diffusion schedule
-        self.diffusion_schedule = get_diffusion_schedule(timesteps)
+        # Time embedding
+        time_embed_dim = base_channels * 4
+        self.time_embed = tf.keras.Sequential([
+            TimestepEmbedding(time_embed_dim),
+            tf.keras.layers.Dense(time_embed_dim),
+            tf.keras.layers.Dense(time_embed_dim),
+        ])
         
-        # Network components
-        self.timestep_embed = TimestepEmbedding(embedding_dims)
-        self.downblocks = []
-        self.upblocks = []
+        # Initialize diffusion parameters
+        betas = get_beta_schedule(timesteps, schedule_type)
+        self.betas = tf.cast(betas, tf.float32)
+        self.alphas = 1.0 - self.betas
+        self.alphas_cumprod = tf.math.cumprod(self.alphas)
+        self.alphas_cumprod_prev = tf.pad(self.alphas_cumprod[:-1], [[1, 0]], constant_values=1.0)
         
-        # Build U-Net architecture
-        input_channels = img_channels
-        for width in widths:
-            for _ in range(block_depth):
-                self.downblocks.append(
-                    self._build_resblock(width, embedding_dims))
-            if width != widths[-1]:
-                self.downblocks.append(self._build_downsample(width))
-                input_channels = width
+        # Create U-Net layers
+        self.input_blocks = []
+        self.middle_block = []
+        self.output_blocks = []
         
-        self.bottleneck = [
-            self._build_resblock(widths[-1], embedding_dims),
-            self._build_resblock(widths[-1], embedding_dims),
-        ]
-        
-        for width in reversed(widths):
-            for _ in range(block_depth):
-                self.upblocks.append(
-                    self._build_resblock(width, embedding_dims))
-            if width != widths[0]:
-                self.upblocks.append(self._build_upsample(width))
-        
-        self.final_conv = tf.keras.layers.Conv2D(img_channels, kernel_size=3, padding='same')
-        
-    def _build_resblock(self, channels, emb_dim):
-        def apply(x, emb, skips=None):
-            inputs = x
-            x = tf.keras.layers.Conv2D(channels, 3, padding='same')(x)
-            x = tf.keras.layers.Activation('swish')(x)
-            
-            # Add timestep embedding
-            emb = tf.keras.layers.Dense(channels)(emb)
-            emb = tf.reshape(emb, [-1, 1, 1, channels])
-            x = x + emb
-            
-            x = tf.keras.layers.Conv2D(channels, 3, padding='same')(x)
-            
-            if skips is not None:
-                x = tf.concat([x, skips], axis=-1)
-            
-            return x + inputs
-        return apply
-    
-    def _build_downsample(self, channels):
-        def apply(x, emb):
-            return tf.keras.layers.Conv2D(
-                channels, 4, strides=2, padding='same')(x)
-        return apply
-    
-    def _build_upsample(self, channels):
-        def apply(x, emb):
-            return tf.keras.layers.Conv2DTranspose(
-                channels, 4, strides=2, padding='same')(x)
-        return apply
-    
-    def diffuse(self, x_0, noise=None, t=None):
-        """Adds noise to images according to diffusion schedule."""
-        batch_size = tf.shape(x_0)[0]
-        if noise is None:
-            noise = tf.random.normal(shape=tf.shape(x_0))
-        if t is None:
-            t = tf.random.uniform(
-                shape=(batch_size,),
-                minval=0,
-                maxval=self.timesteps,
-                dtype=tf.int32
-            )
-            
-        alpha_cumprod = tf.gather(self.diffusion_schedule['alphas_cumprod'], t)
-        alpha_cumprod = tf.reshape(alpha_cumprod, (-1, 1, 1, 1))
-        
-        # Combine signal and noise according to diffusion schedule
-        x_t = (
-            tf.sqrt(alpha_cumprod) * x_0 +
-            tf.sqrt(1 - alpha_cumprod) * noise
-        )
-        return x_t, noise, t
-    
-    def call(self, inputs, training=False):
-        """Predicts noise from noisy images and timesteps."""
-        x, t = inputs
-        
-        # Timestep embedding
-        temb = self.timestep_embed(t)
-        temb = tf.keras.layers.Dense(temb.shape[-1] * 2, activation='swish')(temb)
-        temb = tf.keras.layers.Dense(temb.shape[-1])(temb)
+        # Initial projection
+        channels = base_channels
+        self.conv_in = tf.keras.layers.Conv2D(channels, 3, padding='same')
         
         # Downsampling
-        skips = []
-        x = tf.cast(x, self.compute_dtype)
-        for block in self.downblocks:
-            if 'Conv2D' in block.__class__.__name__:
-                x = block(x)
-                skips.append(x)
-            else:
-                x = block(x, temb)
-                skips.append(x)
+        num_resolutions = len(channel_mults)
+        current_res = img_size
         
-        # Bottleneck
-        for block in self.bottleneck:
-            x = block(x, temb)
+        for level in range(num_resolutions):
+            out_channels = base_channels * channel_mults[level]
+            
+            for _ in range(num_res_blocks):
+                block = [
+                    ResidualBlock(out_channels),
+                    AttentionBlock(out_channels) if current_res <= 16 else tf.keras.layers.Lambda(lambda x: x)
+                ]
+                self.input_blocks.append(block)
+                channels = out_channels
+                
+            if level != num_resolutions - 1:
+                self.input_blocks.append([tf.keras.layers.AveragePooling2D()])
+                current_res = current_res // 2
+        
+        # Middle
+        self.middle_block = [
+            ResidualBlock(channels),
+            AttentionBlock(channels),
+            ResidualBlock(channels),
+        ]
         
         # Upsampling
-        for block in self.upblocks:
-            if 'Conv2DTranspose' in block.__class__.__name__:
-                x = block(x)
-            else:
-                if skips:
-                    x = tf.concat([x, skips.pop()], axis=-1)
-                x = block(x, temb)
+        for level in reversed(range(num_resolutions)):
+            out_channels = base_channels * channel_mults[level]
+            
+            for _ in range(num_res_blocks + 1):
+                block = [
+                    ResidualBlock(out_channels),
+                    AttentionBlock(out_channels) if current_res <= 16 else tf.keras.layers.Lambda(lambda x: x)
+                ]
+                self.output_blocks.append(block)
+                channels = out_channels
+                
+            if level != 0:
+                self.output_blocks.append([tf.keras.layers.UpSampling2D()])
+                current_res = current_res * 2
         
-        # Final prediction
-        x = self.final_conv(x)
-        return x
+        self.conv_out = tf.keras.Sequential([
+            tf.keras.layers.GroupNormalization(groups=8),
+            tf.keras.layers.Activation('swish'),
+            tf.keras.layers.Conv2D(img_channels, 3, padding='same'),
+        ])
+        
+    def call(self, inputs, training=False):
+        x, t = inputs
+        
+        # Time embedding
+        t = self.time_embed(t)
+        
+        # Initial convolution
+        h = self.conv_in(x)
+        
+        # Downsampling
+        hs = [h]
+        for blocks in self.input_blocks:
+            for block in blocks:
+                if isinstance(block, ResidualBlock):
+                    h = block(h, t, training=training)
+                elif isinstance(block, AttentionBlock):
+                    h = block(h)
+                else:
+                    h = block(h)
+            hs.append(h)
+        
+        # Middle
+        for block in self.middle_block:
+            if isinstance(block, ResidualBlock):
+                h = block(h, t, training=training)
+            else:
+                h = block(h)
+        
+        # Upsampling
+        for blocks in self.output_blocks:
+            h = tf.concat([h, hs.pop()], axis=-1)
+            for block in blocks:
+                if isinstance(block, ResidualBlock):
+                    h = block(h, t, training=training)
+                elif isinstance(block, AttentionBlock):
+                    h = block(h)
+                else:
+                    h = block(h)
+        
+        # Output
+        return self.conv_out(h)
     
-    def train_step(self, images):
-        """Custom train step to implement diffusion training."""
+    @tf.function
+    def train_step(self, data):
+        batch_size = tf.shape(data)[0]
+        
+        # Sample timesteps uniformly
+        t = tf.random.uniform(
+            shape=(batch_size,),
+            minval=0,
+            maxval=self.timesteps,
+            dtype=tf.int32
+        )
+        
         with tf.GradientTape() as tape:
-            # Add noise to images
-            x_t, noise, t = self.diffuse(images)
+            # Generate noise
+            noise = tf.random.normal(tf.shape(data))
+            
+            # Get noise schedule parameters for timestep t
+            alpha_cumprod_t = tf.gather(self.alphas_cumprod, t)
+            alpha_cumprod_t = tf.reshape(alpha_cumprod_t, (-1, 1, 1, 1))
+            
+            # Add noise according to schedule
+            noisy_data = (
+                tf.sqrt(alpha_cumprod_t) * data +
+                tf.sqrt(1 - alpha_cumprod_t) * noise
+            )
             
             # Predict noise
-            predicted_noise = self([x_t, t], training=True)
+            predicted_noise = self([noisy_data, t], training=True)
             
-            # Loss is MSE between actual and predicted noise
-            loss = self.compiled_loss(noise, predicted_noise)
-            
-        # Get gradients and update weights
+            # Calculate loss
+            loss = tf.reduce_mean(tf.square(noise - predicted_noise))
+        
+        # Update weights
         gradients = tape.gradient(loss, self.trainable_variables)
         self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
         
-        # Update metrics
-        self.compiled_metrics.update_state(noise, predicted_noise)
-        return {m.name: m.result() for m in self.metrics}
+        return {'loss': loss}
     
-    def generate(self, num_images):
-        """Generates images using the reverse diffusion process."""
-        # Start with pure noise
-        x_t = tf.random.normal((num_images, self.img_size, self.img_size, self.img_channels))
+    def diffusion_schedule(self, n_steps):
+        """Returns diffusion schedule parameters for n_steps."""
+        times = np.arange(n_steps)
+        alphas = self.alphas
+        alpha_cumprod = self.alphas_cumprod
+        alpha_cumprod_prev = self.alphas_cumprod_prev
+        betas = self.betas
         
-        # Gradually denoise
-        for t in reversed(range(self.timesteps)):
-            timesteps = tf.ones((num_images,), dtype=tf.int32) * t
+        return {
+            'times': times,
+            'alphas': alphas,
+            'alpha_cumprod': alpha_cumprod,
+            'alpha_cumprod_prev': alpha_cumprod_prev,
+            'betas': betas
+        }
+    
+    @tf.function
+    def generate(self, batch_size):
+        """Generates images using the reverse diffusion process."""
+        # Start from pure noise
+        x = tf.random.normal((batch_size, self.img_size, self.img_size, self.img_channels))
+        
+        # Iterate through timesteps backwards
+        for t in tf.range(self.timesteps - 1, -1, -1):
+            t_batched = tf.fill([batch_size], t)
             
             # Predict noise
-            predicted_noise = self([x_t, timesteps], training=False)
+            predicted_noise = self([x, t_batched], training=False)
             
-            # Get schedule values for current timestep
-            alpha = self.diffusion_schedule['alphas'][t]
-            alpha_cumprod = self.diffusion_schedule['alphas_cumprod'][t]
-            alpha_cumprod_prev = self.diffusion_schedule['alphas_cumprod_prev'][t]
-            beta = self.diffusion_schedule['betas'][t]
+            # Get schedule parameters
+            alpha = self.alphas[t]
+            alpha_cumprod = self.alphas_cumprod[t]
+            alpha_cumprod_prev = self.alphas_cumprod_prev[t]
+            beta = self.betas[t]
             
-            # Compute variance of q(x_{t-1} | x_t)
-            variance = beta * (1 - alpha_cumprod_prev) / (1 - alpha_cumprod)
-            
-            # Sample from posterior
+            # Only add noise if t > 0
             if t > 0:
-                noise = tf.random.normal(shape=tf.shape(x_t))
+                noise = tf.random.normal(tf.shape(x))
             else:
                 noise = 0
-                
-            x_t = (
-                1 / tf.sqrt(alpha) * (
-                    x_t - 
-                    (beta / (tf.sqrt(1 - alpha_cumprod))) * predicted_noise
-                ) + tf.sqrt(variance) * noise
-            )
             
-        # Scale to [0, 1]
-        x_t = (x_t + 1) / 2
-        x_t = tf.clip_by_value(x_t, 0, 1)
+            # Update x using reverse diffusion formula
+            x = (
+                1 / tf.sqrt(alpha) *
+                (x - (beta / (tf.sqrt(1 - alpha_cumprod))) * predicted_noise)
+                + tf.sqrt(beta) * noise
+            )
         
-        return x_t
+        return x
