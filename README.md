@@ -179,21 +179,7 @@ Contributions are welcome! Please read our [Contributing Guidelines](CONTRIBUTIN
 
 ## 📝 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🎓 Citations
-
-If you use this code in your research, please cite:
-
-```bibtex
-@misc{ddpm2020,
-  title={Denoising Diffusion Probabilistic Models},
-  author={Ho, Jonathan and Jain, Ajay and Abbeel, Pieter},
-  year={2020},
-  eprint={2006.11239},
-  archivePrefix={arXiv}
-}
-```
+This project is licensed under the MIT License 
 
 ## 🙏 Acknowledgments
 
