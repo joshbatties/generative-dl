@@ -147,35 +147,6 @@ def train_step(real_images):
         zip(discriminator_gradients, discriminator.trainable_variables))
 ```
 
-## 📈 Results
-
-Example generations from each model type:
-
-### DDPM Samples
-[Results coming soon]
-
-### VAE Reconstructions
-[Results coming soon]
-
-### GAN Generations
-[Results coming soon]
-
-## 📖 Documentation
-
-Detailed documentation for each model and component is available in the `docs/` directory:
-- [Diffusion Models](docs/diffusion.md)
-- [Autoencoders](docs/autoencoders.md)
-- [GANs](docs/gans.md)
-
-## 🤝 Contributing
-
-Contributions are welcome! Please read our [Contributing Guidelines](CONTRIBUTING.md) first.
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
 
 ## 📝 License
 
