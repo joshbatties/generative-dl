@@ -2,7 +2,7 @@
 
 A comprehensive implementation of modern generative deep learning architectures, including Autoencoders, Generative Adversarial Networks (GANs), and Diffusion Models. Built with TensorFlow/Keras, this repository provides clean, modular implementations along with training scripts and examples.
 
-## 🚀 Features
+## Features
 
 - **Multiple Model Architectures:**
   - Basic and Convolutional Autoencoders
@@ -18,7 +18,7 @@ A comprehensive implementation of modern generative deep learning architectures,
   - Image reconstruction
   - Progressive denoising
 
-## 📦 Installation
+## Installation
 
 ```bash
 # Clone the repository
@@ -29,7 +29,7 @@ cd generative-dl
 pip install -r requirements.txt
 ```
 
-## 💻 Quick Start
+## Quick Start
 
 ### Training a Diffusion Model
 
@@ -95,7 +95,7 @@ dcgan.train(
 )
 ```
 
-## 📚 Model Details
+## Model Details
 
 ### Diffusion Models
 - Implementation of DDPM with improved sampling
@@ -115,7 +115,7 @@ dcgan.train(
 - Progressive growing capability
 - Spectral normalization for stability
 
-## 🛠️ Advanced Usage
+##  Advanced Usage
 
 ### Custom Training Loop
 
@@ -148,11 +148,11 @@ def train_step(real_images):
 ```
 
 
-## 📝 License
+## License
 
 This project is licensed under the MIT License 
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
 - DDPM implementation inspired by the original paper by Ho et al.
 - VAE architecture based on Auto-Encoding Variational Bayes
